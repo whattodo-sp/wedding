@@ -775,7 +775,8 @@ header { position: relative; }
       <div class="modal-title">설정</div>
       <button class="modal-close" onclick="closeModal('settingsModal')">CLOSE ✕</button>
     </div>
-    <label>목표 총예산(원) — 0이면 항목 합계를 그대로 써요</label>
+    <label class="chk"><input type="checkbox" id="setCapAuto" onchange="onCapAutoChange()"> 목표 총예산을 항목 계획 합계에 자동으로 맞추기</label>
+    <label>목표 총예산(원) — 자동 맞춤을 끄면 직접 정한 금액을 써요</label>
     <input type="number" id="setCap" inputmode="numeric">
     <label>예식일</label>
     <input type="date" id="setWedding">
@@ -871,6 +872,10 @@ function uid() { return 'x' + Date.now().toString(36) + Math.random().toString(3
 function clone(o) { return JSON.parse(JSON.stringify(o)); }
 function won(n) { return Math.round(n).toLocaleString('en-US') + '원'; }
 function validDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')); }
+
+// 목표 총예산을 항목 계획 합계에 자동으로 맞출지 (저장돼 있지 않으면 기본값)
+var DEFAULT_CAP_AUTO = false;
+function isCapAuto(st) { return st.settings.capAuto === undefined ? DEFAULT_CAP_AUTO : !!st.settings.capAuto; }
 
 // ── 저장 ───────────────────────────────────────────────────
 function loadState() {
@@ -998,8 +1003,8 @@ function computeView(st, today) {
     c.remaining = c.budget - actual;
     categorySum += Math.max(c.planned, actual);
   });
-  var cap = st.settings.cap || 0;
-  var totalBudget = cap > 0 ? cap : categorySum;
+  var cap = st.settings.cap || 0, capAuto = isCapAuto(st);
+  var totalBudget = (!capAuto && cap > 0) ? cap : categorySum;
   var dDay = null;
   if (validDate(st.settings.weddingDate)) {
     var a = st.settings.weddingDate.split('-'), b = today.split('-');
@@ -1009,7 +1014,7 @@ function computeView(st, today) {
   return {
     summary: { totalBudget: totalBudget, categorySum: categorySum, allocationGap: totalBudget - categorySum, totalSpent: totalSpent,
       totalRemaining: totalBudget - totalSpent, progress: totalBudget > 0 ? totalSpent / totalBudget : 0,
-      weddingDate: st.settings.weddingDate || '', dDay: dDay, capSet: cap > 0 },
+      weddingDate: st.settings.weddingDate || '', dDay: dDay, capSet: cap > 0 && !capAuto, capAuto: capAuto },
     categories: categories, logs: logs, cashflow: computeCashflow(logs, today), excludedNotes: [], card: clone(st.settings.card)
   };
 }
@@ -1165,7 +1170,7 @@ function buildCtx(logs, categoryNames, today, settings) {
   var full = {};
   categoryNames.forEach(function (c) { full[cNorm(cStrip(c))] = true; });
   logs.forEach(function (l) { full[cNorm(cStrip(l.memo))] = true; });
-  return { logs: logs, categories: categoryNames, today: today, heads: heads, full: full, cap: settings && settings.cap || 0, sum: settings && settings.sum, months: settings && settings.months,
+  return { logs: logs, categories: categoryNames, today: today, heads: heads, full: full, cap: settings && settings.cap || 0, sum: settings && settings.sum, months: settings && settings.months, capAuto: !!(settings && settings.capAuto),
     planned: (function () { var o = {}; (settings && settings.planned || []).forEach(function (c) { o[c.name] = c.planned; }); return o; })(),
     keywords: Object.keys(kw).sort(function (a, b) { return b.length - a.length; }) };
 }
@@ -1266,6 +1271,12 @@ function parseSegment(seg, ctx) {
   var hasBudget = /예산/.test(t2);
   var setTo = /(으로|로)\s*(바꿔|바꾸|변경|수정|고쳐|해줘|맞춰|설정|잡아)/.test(t2);
 
+  // 1-0) 자동 맞춤: "목표 총예산을 항목 합계에 자동으로 맞춰줘" / "총예산 자동 맞춤 꺼줘"
+  if (/(총\s*예산|목표\s*예산|목표)/.test(t2) && /(자동|합계|합산)/.test(t2) && !am) {
+    var turnOff = /(꺼|끄|해제|고정)/.test(t2);
+    out.actions.push({ type: 'set_cap_auto', value: !turnOff, label: turnOff ? '목표 총예산 자동 맞춤 끄기 (지금 금액으로 고정)' : '목표 총예산을 항목 계획 합계에 자동으로 맞추기' });
+    return out;
+  }
   // 1) 목표 총예산 / 예식일
   var capWord = /(목표\s*총?\s*예산|총\s*예산|전체\s*예산|목표\s*예산)/.test(t2);
   if (am && !isCat && (capWord || (hasBudget && !ent))) {
@@ -1274,6 +1285,7 @@ function parseSegment(seg, ctx) {
       var nv = Math.max(0, ctx.cap + (down && !up ? -1 : 1) * am.value);
       out.actions.push({ type: 'set_cap', value: nv, label: '목표 총예산 ' + won(ctx.cap) + ' → ' + won(nv) });
     } else out.actions.push({ type: 'set_cap', value: am.value, label: '목표 총예산 → ' + won(am.value) });
+    if (ctx.capAuto) out.notes.push('금액을 직접 정하면 "항목 합계 자동 맞춤"이 꺼져요. 다시 켜려면 "목표 총예산 자동 맞춤"이라고 적어 주세요.');
     return out;
   }
   if (/예식일|결혼식\s*날짜|결혼\s*날짜|식\s*날짜/.test(t2) && dt) {
@@ -1615,7 +1627,9 @@ function applyActions(st, actions) {
       st.categories.forEach(function (c) { if (c.name === a.from) c.name = a.to; });
       st.logs.forEach(function (l) { if (l.category === a.from) l.category = a.to; });
     } else if (a.type === 'set_cap') {
-      st.settings.cap = Number(a.value) || 0;
+      st.settings.cap = Number(a.value) || 0; st.settings.capAuto = false;
+    } else if (a.type === 'set_cap_auto') {
+      st.settings.capAuto = !!a.value;
     } else if (a.type === 'set_wedding') {
       st.settings.weddingDate = a.value;
     }
@@ -1703,7 +1717,7 @@ var API = {
     var today = todayStr();
     var logs = S.logs.map(function (l) { var o = clone(l); o.status = l.date > today ? 'scheduled' : 'paid'; return o; });
     var v0 = computeView(S, today);
-    var ctx = buildCtx(logs, S.categories.map(function (c) { return c.name; }), today, { cap: S.settings.cap, planned: S.categories, sum: v0.summary, months: v0.cashflow.months });
+    var ctx = buildCtx(logs, S.categories.map(function (c) { return c.name; }), today, { cap: v0.summary.totalBudget, capAuto: v0.summary.capAuto, planned: S.categories, sum: v0.summary, months: v0.cashflow.months });
     var actions = [], notes = [], asks = [];
     splitSegments(text).forEach(function (seg) {
       var r = parseSegment(seg, ctx);
@@ -1731,11 +1745,12 @@ var API = {
   },
 
   // 설정 / 데이터
-  getSettings: function () { return clone(S.settings); },
+  getSettings: function () { var o = clone(S.settings); o.capAuto = isCapAuto(S); return o; },
   saveSettings: function (o) {
     var s = S.settings;
     if (o.weddingDate !== undefined) s.weddingDate = validDate(o.weddingDate) ? o.weddingDate : '';
-    if (o.cap !== undefined) s.cap = Math.max(0, Number(o.cap) || 0);
+    if (o.capAuto !== undefined) s.capAuto = !!o.capAuto;
+    if (o.cap !== undefined && !isCapAuto(S)) s.cap = Math.max(0, Number(o.cap) || 0);
     var oldPay = s.card.payDay, oldCut = s.card.cutoffDay;
     if (o.payDay !== undefined) s.card.payDay = clampInt(o.payDay, 1, 31, s.card.payDay);
     if (o.cutoffDay !== undefined) s.card.cutoffDay = clampInt(o.cutoffDay, 1, 31, s.card.cutoffDay);
@@ -2127,7 +2142,7 @@ function render() {
 
   var html = '';
   html += '<div class="section-label">TOTAL BUDGET SUMMARY</div>';
-  html += rline(s.capSet ? '목표 총예산' : '계획 합계(목표 미설정)', fmt(s.totalBudget) + '원');
+  html += rline(s.capAuto ? '목표 총예산 (항목 합계 자동)' : (s.capSet ? '목표 총예산' : '계획 합계(목표 미설정)'), fmt(s.totalBudget) + '원');
   html += rline('결제 완료(SPENT)', fmt(s.totalSpent) + '원');
   html += '<hr class="dash">';
   html += '<div class="bar-ascii ' + (ratio > 100 ? 'warn' : '') + '">' + asciiBar(ratio) + '  ' + ratio + '%</div>';
@@ -2504,6 +2519,8 @@ function startOnb(mode) {
 
 function openSettings() {
   google.script.run.withSuccessHandler(function (st) {
+    document.getElementById('setCapAuto').checked = !!st.capAuto;
+    document.getElementById('setCap').disabled = !!st.capAuto;
     document.getElementById('setCap').value = st.cap || 0;
     document.getElementById('setWedding').value = st.weddingDate || '';
     document.getElementById('setPayDay').value = st.card.payDay;
@@ -2513,6 +2530,8 @@ function openSettings() {
     openModal('settingsModal');
   }).getSettings();
 }
+
+function onCapAutoChange() { document.getElementById('setCap').disabled = document.getElementById('setCapAuto').checked; }
 
 function saveSettingsUI() {
   var msg = document.getElementById('setMsg');
@@ -2524,6 +2543,7 @@ function saveSettingsUI() {
   }).withFailureHandler(function (e) {
     msg.textContent = 'ERROR: ' + e.message; msg.className = 'form-msg err';
   }).saveSettings({
+    capAuto: document.getElementById('setCapAuto').checked,
     cap: document.getElementById('setCap').value,
     weddingDate: document.getElementById('setWedding').value,
     payDay: document.getElementById('setPayDay').value,
